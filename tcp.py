@@ -73,52 +73,63 @@ class Conexao:
         self.expected_seq_no = seq_no + 1
         self.callback = None
         self.sendbase = 0
-        self.start = 0
-        self.end = 0
+        self.start = time.time()
+        self.end = time.time()
         self.reenvio = False
-        self.sampleRTT = 0
+        self.sampleRTT = 0.0
         self.estimatedRTT = -1
         self.devRTT = -1
-        self.timeoutInterval = 0
-        self.timer = asyncio.get_event_loop().call_later(self.timeoutInterval, self._exemplo_timer)
-        self.timer.cancel()
+        self.timeoutInterval = 1
+        self.timer = None
         self.pending_segments = []
+        self.window_size = 1*MSS
+        self.buffer = []
 
     def _exemplo_timer(self):
-        # Esta função é só um exemplo e pode ser removida
         src_addr, src_port, dst_addr, dst_port = self.id_conexao[0], self.id_conexao[1], \
              self.id_conexao[2], self.id_conexao[3] # Coleta informações de endereço
+    
+        # Verifica se é possivel inserir mais segmentos do buffer para o pending
+        if len(self.pending_segments) < self.window_size:
+            append_count = min( len(self.buffer), self.window_size - len(self.pending_segments) )
+            for _ in range( append_count ):
+                self.pending_segments.append(self.buffer[0])
+                self.buffer.pop(0)
 
         if len(self.pending_segments) > 0:
+            self.window_size = max(1, self.window_size // 2)
+            # TODO: ae penajo, acho que essa parte comentada ai ta certa sim
+            # # Verifica se o pending possui mais segmentos do que o permitido
+            # if len(self.pending_segments) > self.window_size // MSS:
+            #     remove_count = len(self.pending_segments) - self.window_size
+            #     for _ in range( remove_count ):
+            #         self.buffer.insert(0, self.pending_segments[self.window_size // MSS])
+            #         self.pending_segments.pop( self.window_size // MSS )
             self.servidor.rede.enviar(fix_checksum(self.pending_segments[0], src_addr, dst_addr), src_addr)
             self.reenvio = True
-            #self.timer = asyncio.get_event_loop().call_later(1, self._exemplo_timer)
+            # self.timer = asyncio.get_event_loop().call_later(1, self._exemplo_timer)
         
 
     def _set_timer_info(self, segment):
-        self.pending_segments.append(segment)
+        if len(self.pending_segments) < self.window_size:
+            self.pending_segments.append(segment)
+        else:
+            self.buffer.append(segment)
 
 
     def _calc_rtt(self):
-        if self.start > 0:
-            self.end = time.time()
-            print('recv: ', self.end)
-            connect_ack = True if self.sampleRTT == 0 else False
-            self.sampleRTT = self.end - self.start
-            print('sampleRTT = ', self.sampleRTT)
+        self.end = time.time()
+        connect_ack = True if self.sampleRTT <= 0 else False
+        self.sampleRTT = self.end - self.start
+    
+        if connect_ack:
+            self.estimatedRTT = self.sampleRTT
+            self.devRTT = self.sampleRTT/2
+        else: 
+            self.estimatedRTT = (1 - ALPHA)*self.estimatedRTT + ALPHA*self.sampleRTT
+            self.devRTT = (1 - BETA)*self.devRTT + BETA*abs(self.sampleRTT - self.estimatedRTT)
+        self.timeoutInterval = self.estimatedRTT + 4.0*self.devRTT
 
-            if connect_ack:
-                self.estimatedRTT = self.sampleRTT
-                self.devRTT = self.sampleRTT/2
-            else: 
-                self.estimatedRTT = (1 - ALPHA)*self.estimatedRTT + ALPHA*self.sampleRTT
-                self.devRTT = (1 - BETA)*self.devRTT + BETA*abs(self.sampleRTT - self.estimatedRTT)
-            self.timeoutInterval = self.estimatedRTT + 4.0*self.devRTT
-
-            print('estimatedRTT = ', self.estimatedRTT)
-            print('devRTT = ', self.devRTT)
-            print('timeoutInterval = ', self.timeoutInterval)
-            print('-------------------')
 
     def _rdt_rcv(self, seq_no, ack_no, flags, payload):
         # TODO: trate aqui o recebimento de segmentos provenientes da camada de rede.
@@ -136,7 +147,6 @@ class Conexao:
                     src_port, self.seq_no, self.ack_no, flags), src_addr, \
                          dst_addr), src_addr)
         elif self.expected_seq_no == seq_no:
-            self.reenvio = False
             dados = payload
             self.expected_seq_no += len(payload)
             self.ack_no = seq_no + len(payload)
@@ -147,17 +157,26 @@ class Conexao:
                 self.servidor.rede.enviar(fix_checksum(make_header(dst_port, \
                     src_port, self.seq_no + 1, self.ack_no, flags), src_addr, \
                          dst_addr), src_addr)
-             
+                         
+            # Acho que isso n ta certo
+            # if len(self.buffer) > 0:
+            #     for _ in range( min(len(self.buffer), self.window_size // MSS) ):
+            #         self.servidor.rede.enviar(fix_checksum(self.buffer[0], src_addr, dst_addr), dst_addr)
+            #         self.buffer.pop(0)
+            # Acho que tem q ter um if nesse estilo aq (n tenho certeza da conta na segunda parte do if):
+            # if window_size = abs(self.seq_no - ack_no) (o professor no video fala que o ack_no tem que chegar no valor de window_size)
+            self.window_size += 1*MSS
+
+            if len(self.pending_segments) > 0 and not self.reenvio:
+                self._calc_rtt() 
             if ack_no > self.sendbase:
-                if not self.reenvio:
-                    self._calc_rtt()
                 self.sendbase = ack_no
+                if self.timer is not None:
+                    self.timer.cancel()
                 if len(self.pending_segments) > 0:
                     self.pending_segments.pop(0)
                     self.timer = asyncio.get_event_loop().call_later(self.timeoutInterval, self._exemplo_timer)
-                else:
-                    self.timer.cancel()
-                    
+            self.reenvio = False        
 
         
     # Os métodos abaixo fazem parte da API
@@ -181,7 +200,11 @@ class Conexao:
              self.id_conexao[2], self.id_conexao[3] # Coleta informações de endereço
 
         # Dividindo o payload em pacotes
+        # Temos que adaptar essa divisao do payload de acordo com a fila de não enviados
+        self.start = time.time()
         if len(dados) >= MSS:
+            print('social credits:', len(dados) // MSS, 'window size:', self.window_size)
+
             i = 0
             max_it = math.ceil((1.0*len(dados)) / MSS)
             self.sendbase = self.seq_no + 1
@@ -191,17 +214,25 @@ class Conexao:
                 segment = make_header(dst_port, src_port, self.seq_no + 1, self.ack_no, flags)    
                 # Enviando informações para o protocolo IP
                 payload = dados[MSS*i:MSS*(i+1)]
-                self.servidor.rede.enviar(fix_checksum(segment + payload, src_addr, dst_addr), dst_addr)
-                if not self.reenvio:
-                    self.start = time.time()
+                self.servidor.rede.enviar(fix_checksum(segment + payload, src_addr, dst_addr), dst_addr)  
                 # armazena os segmentos
                 self._set_timer_info(segment + payload)
                 # atualiza o numero de sequencia
                 self.seq_no += len(payload)
+
+                # TODO: Caso 7
+                # if i+1 < self.window_size // MSS:
+                #     self.servidor.rede.enviar(fix_checksum(segment + payload, src_addr, dst_addr), dst_addr)  
+                #     # armazena os segmentos
+                #     self._set_timer_info(segment + payload)
+                #     # atualiza o numero de sequencia
+                #     self.seq_no += len(payload)
+                # else:
+                #     self.buffer.append(segment + payload)
                 i += 1
-            print('sent: ', self.start)
-            if (not self.timer) or (self.timer and self.timer.cancelled()):
-                self.timer = asyncio.get_event_loop().call_later(self.timeoutInterval, self._exemplo_timer)
+            if self.timer is not None:
+                self.timer.cancel()
+            self.timer = asyncio.get_event_loop().call_later(self.timeoutInterval, self._exemplo_timer)
         else: 
             # Preparando envio
             flags = FLAGS_ACK
@@ -209,14 +240,12 @@ class Conexao:
             payload = b''
             # Enviando informações para o protocolo IP
             self.servidor.rede.enviar(fix_checksum(segment + dados, src_addr, dst_addr), dst_addr)
-            if not self.reenvio:
-                self.start = time.time()
-            print('sent: ', self.start)
             
             # Inicializa o timer para retransmissao
-            if (not self.timer) or (self.timer and self.timer.cancelled()):
-                self._set_timer_info(segment + payload)
-                self.timer = asyncio.get_event_loop().call_later(self.timeoutInterval, self._exemplo_timer)
+            if self.timer is not None:
+                self.timer.cancel()
+            self._set_timer_info(segment + payload)
+            self.timer = asyncio.get_event_loop().call_later(self.timeoutInterval, self._exemplo_timer)
             # atualiza o numero de sequencia
             self.seq_no += len(dados)
         
