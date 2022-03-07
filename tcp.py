@@ -1,4 +1,5 @@
 import asyncio
+import re
 import time
 from grader.tcputils import FLAGS_ACK, FLAGS_FIN, MSS, calc_checksum, fix_checksum, make_header, read_header
 from tcputils import *
@@ -65,6 +66,7 @@ class Servidor:
 
 class Conexao:
     def __init__(self, servidor, id_conexao, seq_no, ack_no):
+        # Variáveis básicas do protocolo TCP
         self.servidor = servidor
         self.id_conexao = id_conexao
         self.seq_no = seq_no
@@ -72,52 +74,42 @@ class Conexao:
         self.seq_envio = ack_no
         self.expected_seq_no = seq_no + 1
         self.callback = None
+        # Variáveis necessárias para executar retransmissão de dados
         self.sendbase = 0
         self.start = time.time()
         self.end = time.time()
         self.reenvio = False
+        # Necessário para calculo de timeout
         self.sampleRTT = 0.0
         self.estimatedRTT = -1
         self.devRTT = -1
         self.timeoutInterval = 1
         self.timer = None
+        # Necessário para variar o tamanho do fluxo de dados
         self.pending_segments = []
+        self.pending_segments_payload = []
         self.window_size = 1*MSS
+        self.rcv_window_size = 0
         self.buffer = []
+        self.buffer_payload = []
 
     def _exemplo_timer(self):
         src_addr, src_port, dst_addr, dst_port = self.id_conexao[0], self.id_conexao[1], \
              self.id_conexao[2], self.id_conexao[3] # Coleta informações de endereço
     
-        # Verifica se é possivel inserir mais segmentos do buffer para o pending
-        if len(self.pending_segments) < self.window_size:
-            append_count = min( len(self.buffer), self.window_size - len(self.pending_segments) )
-            for _ in range( append_count ):
-                self.pending_segments.append(self.buffer[0])
-                self.buffer.pop(0)
-
         if len(self.pending_segments) > 0:
-            self.window_size = max(1, self.window_size // 2)
-            # TODO: ae penajo, acho que essa parte comentada ai ta certa sim
-            # # Verifica se o pending possui mais segmentos do que o permitido
-            # if len(self.pending_segments) > self.window_size // MSS:
-            #     remove_count = len(self.pending_segments) - self.window_size
-            #     for _ in range( remove_count ):
-            #         self.buffer.insert(0, self.pending_segments[self.window_size // MSS])
-            #         self.pending_segments.pop( self.window_size // MSS )
+            self.window_size = ((self.window_size//MSS)//2)*MSS
             self.servidor.rede.enviar(fix_checksum(self.pending_segments[0], src_addr, dst_addr), src_addr)
             self.reenvio = True
             # self.timer = asyncio.get_event_loop().call_later(1, self._exemplo_timer)
         
-
-    def _set_timer_info(self, segment):
-        if len(self.pending_segments) < self.window_size:
-            self.pending_segments.append(segment)
-        else:
-            self.buffer.append(segment)
-
+    def _set_timer_info(self, segment, tam_payload):
+        # Função para adicionar segmentos enviados porém não confirmados
+        self.pending_segments.append(segment)
+        self.pending_segments_payload.append(tam_payload)
 
     def _calc_rtt(self):
+        # Aqui é realizado o calculo do tempo de espera da função timeout
         self.end = time.time()
         connect_ack = True if self.sampleRTT <= 0 else False
         self.sampleRTT = self.end - self.start
@@ -129,7 +121,6 @@ class Conexao:
             self.estimatedRTT = (1 - ALPHA)*self.estimatedRTT + ALPHA*self.sampleRTT
             self.devRTT = (1 - BETA)*self.devRTT + BETA*abs(self.sampleRTT - self.estimatedRTT)
         self.timeoutInterval = self.estimatedRTT + 4.0*self.devRTT
-
 
     def _rdt_rcv(self, seq_no, ack_no, flags, payload):
         # TODO: trate aqui o recebimento de segmentos provenientes da camada de rede.
@@ -157,30 +148,31 @@ class Conexao:
                 self.servidor.rede.enviar(fix_checksum(make_header(dst_port, \
                     src_port, self.seq_no + 1, self.ack_no, flags), src_addr, \
                          dst_addr), src_addr)
-                         
-            # Acho que isso n ta certo
-            # if len(self.buffer) > 0:
-            #     for _ in range( min(len(self.buffer), self.window_size // MSS) ):
-            #         self.servidor.rede.enviar(fix_checksum(self.buffer[0], src_addr, dst_addr), dst_addr)
-            #         self.buffer.pop(0)
-            # Acho que tem q ter um if nesse estilo aq (n tenho certeza da conta na segunda parte do if):
-            # if window_size = abs(self.seq_no - ack_no) (o professor no video fala que o ack_no tem que chegar no valor de window_size)
-            self.window_size += 1*MSS
 
+            
             if len(self.pending_segments) > 0 and not self.reenvio:
                 self._calc_rtt() 
             if ack_no > self.sendbase:
+                aux = self.sendbase
                 self.sendbase = ack_no
                 if self.timer is not None:
                     self.timer.cancel()
                 if len(self.pending_segments) > 0:
-                    self.pending_segments.pop(0)
+                    # verifica se recebemos uma janela inteira:
+                    while aux < ack_no and len(self.pending_segments) > 0:
+                        variavel = self.pending_segments_payload.pop(0)
+                        self.pending_segments.pop(0)
+                        self.rcv_window_size += variavel
+                        aux += variavel
+                    if self.window_size <= self.rcv_window_size: 
+                        self.window_size += MSS 
+                        self.rcv_window_size = 0
                     self.timer = asyncio.get_event_loop().call_later(self.timeoutInterval, self._exemplo_timer)
+                    if len(self.buffer) > 0:
+                        self.enviar('👍', True)
             self.reenvio = False        
 
-        
     # Os métodos abaixo fazem parte da API
-
     def registrar_recebedor(self, callback):
         """
         Usado pela camada de aplicação para registrar uma função para ser chamada
@@ -188,7 +180,7 @@ class Conexao:
         """
         self.callback = callback
 
-    def enviar(self, dados):
+    def enviar(self, dados, rest = False):
         """
         Usado pela camada de aplicação para enviar dados
         """
@@ -202,62 +194,81 @@ class Conexao:
         # Dividindo o payload em pacotes
         # Temos que adaptar essa divisao do payload de acordo com a fila de não enviados
         self.start = time.time()
-        if len(dados) >= MSS:
-            print('social credits:', len(dados) // MSS, 'window size:', self.window_size)
-
-            i = 0
-            max_it = math.ceil((1.0*len(dados)) / MSS)
-            self.sendbase = self.seq_no + 1
-            while i < max_it:
-                # Preparando envio
-                flags = FLAGS_ACK
-                segment = make_header(dst_port, src_port, self.seq_no + 1, self.ack_no, flags)    
-                # Enviando informações para o protocolo IP
-                payload = dados[MSS*i:MSS*(i+1)]
-                self.servidor.rede.enviar(fix_checksum(segment + payload, src_addr, dst_addr), dst_addr)  
-                # armazena os segmentos
-                self._set_timer_info(segment + payload)
-                # atualiza o numero de sequencia
-                self.seq_no += len(payload)
-
-                # TODO: Caso 7
-                # if i+1 < self.window_size // MSS:
-                #     self.servidor.rede.enviar(fix_checksum(segment + payload, src_addr, dst_addr), dst_addr)  
-                #     # armazena os segmentos
-                #     self._set_timer_info(segment + payload)
-                #     # atualiza o numero de sequencia
-                #     self.seq_no += len(payload)
-                # else:
-                #     self.buffer.append(segment + payload)
-                i += 1
+        if not rest:
+            if not self.reenvio:
+                if len(dados) >= MSS:
+                    i = 0
+                    max_it = math.ceil((1.0*len(dados)) / MSS)
+                    self.sendbase = self.seq_no + 1
+                    while i < max_it:
+                        # Preparando envio
+                        flags = FLAGS_ACK
+                        segment = make_header(dst_port, src_port, self.seq_no + 1, self.ack_no, flags)
+                        # Enviando informações para o protocolo IP
+                        payload = dados[MSS*i:MSS*(i+1)]
+                        self.seq_no += len(payload)
+                        # TODO: Caso 7
+                        # Adiciona os segmentos no buffer para ser enviados
+                        self.buffer.append(fix_checksum(segment + payload, src_addr, dst_addr))
+                        self.buffer_payload.append(len(payload))
+                        # Verifica se é possivel inserir mais segmentos do buffer para o pending
+                        i += 1
+                    # Realiza o envio dos segmentos que precisam ser enviados e cabem na window_size (banda)
+                    # qt_envios = (self.window_size // MSS) - len(self.pending_segments)
+                    qtd_enviado = sum(self.pending_segments_payload)
+                    for _ in range(len(self.buffer)):
+                        if qtd_enviado + self.buffer_payload[0] > self.window_size:
+                            break
+                        payload = self.buffer.pop(0)
+                        tam_payload = self.buffer_payload.pop(0)
+                        self.servidor.rede.enviar(payload, dst_addr)
+                        self._set_timer_info(payload, tam_payload)
+                        qtd_enviado += tam_payload
+                        
+                    if self.timer is not None:
+                        self.timer.cancel()
+                    self.timer = asyncio.get_event_loop().call_later(self.timeoutInterval, self._exemplo_timer)
+            else:
+                self.servidor.rede.enviar(self.pending_segments[0], dst_addr)
+        else:
+            qtd_enviado = sum(self.pending_segments_payload)
+            for j in range(len(self.buffer)):
+                if qtd_enviado + self.buffer_payload[0] > self.window_size:
+                    break
+                payload = self.buffer.pop(0)
+                tam_payload = self.buffer_payload.pop(0)
+                self.servidor.rede.enviar(payload, dst_addr)
+                self._set_timer_info(payload, tam_payload)
+                qtd_enviado += tam_payload
+                
             if self.timer is not None:
                 self.timer.cancel()
             self.timer = asyncio.get_event_loop().call_later(self.timeoutInterval, self._exemplo_timer)
-        else: 
-            # Preparando envio
-            flags = FLAGS_ACK
-            segment = make_header(dst_port, src_port, self.seq_no + 1, self.ack_no, flags)    
-            payload = b''
-            # Enviando informações para o protocolo IP
-            self.servidor.rede.enviar(fix_checksum(segment + dados, src_addr, dst_addr), dst_addr)
+                        
+
+        
+        # Nunca entra nesse else
+        # else: 
+        #     # Preparando envio
+        #     flags = FLAGS_ACK
+        #     segment = make_header(dst_port, src_port, self.seq_no + 1, self.ack_no, flags)    
+        #     payload = b''
+        #     # Enviando informações para o protocolo IP
+        #     self.servidor.rede.enviar(fix_checksum(segment + dados, src_addr, dst_addr), dst_addr)
             
-            # Inicializa o timer para retransmissao
-            if self.timer is not None:
-                self.timer.cancel()
-            self._set_timer_info(segment + payload)
-            self.timer = asyncio.get_event_loop().call_later(self.timeoutInterval, self._exemplo_timer)
-            # atualiza o numero de sequencia
-            self.seq_no += len(dados)
+        #     # Inicializa o timer para retransmissao
+        #     if self.timer is not None:
+        #         self.timer.cancel()
+        #     self._set_timer_info(segment + payload)
+        #     self.timer = asyncio.get_event_loop().call_later(self.timeoutInterval, self._exemplo_timer)
+        #     # atualiza o numero de sequencia
+        #     self.seq_no += len(dados)
         
-
-        
-
     def fechar(self):
         """
         Usado pela camada de aplicação para fechar a conexão
         """
         # TODO: implemente aqui o fechamento de conexão
-
         src_addr, src_port, dst_addr, dst_port = self.id_conexao[0], self.id_conexao[1], \
              self.id_conexao[2], self.id_conexao[3] # Coleta informações de endereço
 
